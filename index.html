@@ -614,29 +614,39 @@ let sharedCtx=null;
 let deferredInstallPrompt=null;
 let droneNodes=[];
 
-// ── Audio context — unlocked on first user gesture ────────────────────────────
+// ── AudioContext — created and unlocked synchronously on first gesture ────────
+// iOS Safari requires AudioContext to be created AND resumed inside a touchend/click.
+// We also play a silent buffer immediately after creation to fully unlock it.
+function unlockAudio(){
+  if(sharedCtx) return sharedCtx;
+  sharedCtx = new(window.AudioContext||window.webkitAudioContext)();
+  // Play a silent buffer — this is the iOS unlock trick
+  const buf = sharedCtx.createBuffer(1,1,22050);
+  const src = sharedCtx.createBufferSource();
+  src.buffer = buf; src.connect(sharedCtx.destination); src.start(0);
+  if(sharedCtx.state==='suspended') sharedCtx.resume();
+  return sharedCtx;
+}
 function getCtx(){
-  if(!sharedCtx) sharedCtx=new(window.AudioContext||window.webkitAudioContext)();
+  if(!sharedCtx) return unlockAudio();
   if(sharedCtx.state==='suspended') sharedCtx.resume();
   return sharedCtx;
 }
 function noteToFreq(note,octave){return 440*Math.pow(2,(NOTES.indexOf(note)+(octave+1)*12-69)/12);}
 
-// ── Piano synth — 100% Web Audio, no CDN needed ───────────────────────────────
-// Layered oscillator approach: sawtooth body + filtered harmonics + short attack transient
-// Sounds like a clean electric piano / keys patch. Works offline, no loading delay.
+// ── Piano synth — pure Web Audio, no CDN, works 100% offline ─────────────────
+// All notes are scheduled using the AudioContext clock (startTime parameter).
+// This means the entire progression can be scheduled at once inside one gesture,
+// solving the iOS "audio only works in gesture handler" restriction completely.
 function synthPianoNote(ctx, freq, startTime, sustainSec, vol){
   const out = ctx.createGain();
   out.connect(ctx.destination);
-
-  // Master envelope: fast attack, decay to sustain level, slow release
   out.gain.setValueAtTime(0, startTime);
   out.gain.linearRampToValueAtTime(vol, startTime + 0.006);
   out.gain.exponentialRampToValueAtTime(vol * 0.45, startTime + 0.08);
   out.gain.exponentialRampToValueAtTime(vol * 0.35, startTime + 0.3);
   out.gain.exponentialRampToValueAtTime(0.0001, startTime + sustainSec);
 
-  // Lowpass filter — rolls off harshness, sweeps down for natural decay
   const lp = ctx.createBiquadFilter();
   lp.type = 'lowpass';
   lp.frequency.setValueAtTime(freq * 14, startTime);
@@ -644,102 +654,77 @@ function synthPianoNote(ctx, freq, startTime, sustainSec, vol){
   lp.Q.value = 0.6;
   lp.connect(out);
 
-  // Sawtooth — rich in harmonics, gives the characteristic "keys" brightness
-  const saw = ctx.createOscillator();
-  saw.type = 'sawtooth';
-  saw.frequency.value = freq;
-  const gSaw = ctx.createGain(); gSaw.gain.value = 0.7;
-  saw.connect(gSaw); gSaw.connect(lp);
-  saw.start(startTime); saw.stop(startTime + sustainSec + 0.05);
+  const saw = ctx.createOscillator(); saw.type='sawtooth'; saw.frequency.value=freq;
+  const gSaw = ctx.createGain(); gSaw.gain.value=0.7;
+  saw.connect(gSaw); gSaw.connect(lp); saw.start(startTime); saw.stop(startTime+sustainSec+0.05);
 
-  // Sine fundamental — adds warmth and body under the sawtooth
-  const sine = ctx.createOscillator();
-  sine.type = 'sine';
-  sine.frequency.value = freq;
-  const gSine = ctx.createGain(); gSine.gain.value = 0.5;
-  sine.connect(gSine); gSine.connect(out); // bypass filter for warmth
-  sine.start(startTime); sine.stop(startTime + sustainSec + 0.05);
+  const sine = ctx.createOscillator(); sine.type='sine'; sine.frequency.value=freq;
+  const gSine = ctx.createGain(); gSine.gain.value=0.5;
+  sine.connect(gSine); gSine.connect(out); sine.start(startTime); sine.stop(startTime+sustainSec+0.05);
 
-  // Detuned copy (+7 cents) — adds subtle chorus/width
-  const saw2 = ctx.createOscillator();
-  saw2.type = 'sawtooth';
-  saw2.frequency.value = freq * Math.pow(2, 7/1200);
-  const gSaw2 = ctx.createGain(); gSaw2.gain.value = 0.18;
-  saw2.connect(gSaw2); gSaw2.connect(lp);
-  saw2.start(startTime); saw2.stop(startTime + sustainSec + 0.05);
+  const saw2 = ctx.createOscillator(); saw2.type='sawtooth'; saw2.frequency.value=freq*Math.pow(2,7/1200);
+  const gSaw2 = ctx.createGain(); gSaw2.gain.value=0.18;
+  saw2.connect(gSaw2); gSaw2.connect(lp); saw2.start(startTime); saw2.stop(startTime+sustainSec+0.05);
 
-  // Short noise burst — gives the "hammer" attack click
-  const clickDur = 0.009;
-  const bufSize = Math.ceil(ctx.sampleRate * clickDur);
-  const nb = ctx.createBuffer(1, bufSize, ctx.sampleRate);
-  const nd2 = nb.getChannelData(0);
-  for(let i=0;i<bufSize;i++) nd2[i] = (Math.random()*2-1) * (1 - i/bufSize);
-  const clickSrc = ctx.createBufferSource(); clickSrc.buffer = nb;
-  const clickBP = ctx.createBiquadFilter(); clickBP.type='bandpass'; clickBP.frequency.value=freq*2; clickBP.Q.value=1.2;
-  const clickGain = ctx.createGain();
-  clickGain.gain.setValueAtTime(vol*1.4, startTime);
-  clickGain.gain.exponentialRampToValueAtTime(0.0001, startTime+clickDur);
-  clickSrc.connect(clickBP); clickBP.connect(clickGain); clickGain.connect(out);
-  clickSrc.start(startTime); clickSrc.stop(startTime+clickDur+0.002);
+  // Hammer transient — short noise click for definition
+  const clickDur=0.009;
+  const bufSize=Math.ceil(ctx.sampleRate*clickDur);
+  const nb=ctx.createBuffer(1,bufSize,ctx.sampleRate);
+  const nd2=nb.getChannelData(0);
+  for(let i=0;i<bufSize;i++) nd2[i]=(Math.random()*2-1)*(1-i/bufSize);
+  const clk=ctx.createBufferSource(); clk.buffer=nb;
+  const clkBP=ctx.createBiquadFilter(); clkBP.type='bandpass'; clkBP.frequency.value=freq*2; clkBP.Q.value=1.2;
+  const clkG=ctx.createGain(); clkG.gain.setValueAtTime(vol*1.4,startTime); clkG.gain.exponentialRampToValueAtTime(0.0001,startTime+clickDur);
+  clk.connect(clkBP); clkBP.connect(clkG); clkG.connect(out);
+  clk.start(startTime); clk.stop(startTime+clickDur+0.002);
 }
 
-// Strike all 4 chord tones with slight arpeggio (20ms between each)
-function synthStrikeChord(chord, sustainSec, vel){
-  const ctx = getCtx();
+// Schedule one chord's 4 tones at a given absolute AudioContext time
+function scheduleChord(ctx, chord, atTime, sustainSec, vel, withBass){
   const ivs = QUAL_INTERVALS[chord.type];
   ivs.forEach((iv, i) => {
-    const note = getNote(chord.root, iv);
-    const freq = noteToFreq(note, CHORD_OCTAVE);
-    const tOffset = i * 0.020;
-    const v = i === 0 ? vel : vel * 0.68;
-    synthPianoNote(ctx, freq, ctx.currentTime + tOffset, (sustainSec || 1.5) - tOffset, v);
+    const freq = noteToFreq(getNote(chord.root, iv), CHORD_OCTAVE);
+    const t = atTime + i * 0.020;
+    synthPianoNote(ctx, freq, t, sustainSec - i*0.020, i===0 ? vel : vel*0.68);
   });
+  if(withBass) scheduleBass(ctx, chord.root, atTime, sustainSec);
 }
 
 // ── Bass synth ────────────────────────────────────────────────────────────────
-function playBassRoot(note, sustainSec){
-  const ctx = getCtx();
+function scheduleBass(ctx, note, atTime, sustainSec){
   const freq = noteToFreq(note, BASS_OCTAVE);
-  const t = ctx.currentTime;
   const vol = 0.70;
   const lp = ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=Math.min(freq*5,1100); lp.Q.value=0.7; lp.connect(ctx.destination);
   const master = ctx.createGain();
-  master.gain.setValueAtTime(0,t); master.gain.linearRampToValueAtTime(vol,t+0.025);
-  master.gain.setValueAtTime(vol,t+sustainSec*0.5); master.gain.exponentialRampToValueAtTime(0.001,t+sustainSec);
+  master.gain.setValueAtTime(0,atTime); master.gain.linearRampToValueAtTime(vol,atTime+0.025);
+  master.gain.setValueAtTime(vol,atTime+sustainSec*0.5); master.gain.exponentialRampToValueAtTime(0.001,atTime+sustainSec);
   master.connect(lp);
-  const sine = ctx.createOscillator(); sine.type='sine'; sine.frequency.value=freq;
-  const gS = ctx.createGain(); gS.gain.value=1.0; sine.connect(gS); gS.connect(master); sine.start(t); sine.stop(t+sustainSec+0.1);
-  const tri = ctx.createOscillator(); tri.type='triangle'; tri.frequency.value=freq*2;
-  const gT = ctx.createGain(); gT.gain.value=0.3; tri.connect(gT); gT.connect(master); tri.start(t); tri.stop(t+sustainSec+0.1);
+  const sine=ctx.createOscillator(); sine.type='sine'; sine.frequency.value=freq;
+  const gS=ctx.createGain(); gS.gain.value=1.0; sine.connect(gS); gS.connect(master); sine.start(atTime); sine.stop(atTime+sustainSec+0.1);
+  const tri=ctx.createOscillator(); tri.type='triangle'; tri.frequency.value=freq*2;
+  const gT=ctx.createGain(); gT.gain.value=0.3; tri.connect(gT); gT.connect(master); tri.start(atTime); tri.stop(atTime+sustainSec+0.1);
 }
 
 // ── User sample playback ──────────────────────────────────────────────────────
-function userSamplerStrike(note, octave, vol){
+function scheduleUserSample(ctx, note, octave, atTime, vol){
   if(!userSampleBuffer) return;
-  const ctx = getCtx(); const t = ctx.currentTime;
-  const rootNote = document.getElementById('sample-root').value;
-  const rootOct = parseInt(document.getElementById('sample-octave').value);
-  const semitones = (NOTES.indexOf(note)+(octave+1)*12) - (NOTES.indexOf(rootNote)+(rootOct+1)*12);
-  const src = ctx.createBufferSource(); src.buffer=userSampleBuffer; src.playbackRate.value=Math.pow(2,semitones/12);
-  const env = ctx.createGain(); env.gain.setValueAtTime(vol,t); env.gain.setValueAtTime(vol,t+1.2); env.gain.exponentialRampToValueAtTime(0.0001,t+2.2);
-  src.connect(env); env.connect(ctx.destination); src.start(t); src.stop(t+2.3);
+  const rootNote=document.getElementById('sample-root').value;
+  const rootOct=parseInt(document.getElementById('sample-octave').value);
+  const semitones=(NOTES.indexOf(note)+(octave+1)*12)-(NOTES.indexOf(rootNote)+(rootOct+1)*12);
+  const src=ctx.createBufferSource(); src.buffer=userSampleBuffer; src.playbackRate.value=Math.pow(2,semitones/12);
+  const env=ctx.createGain(); env.gain.setValueAtTime(vol,atTime); env.gain.setValueAtTime(vol,atTime+1.2); env.gain.exponentialRampToValueAtTime(0.0001,atTime+2.2);
+  src.connect(env); env.connect(ctx.destination); src.start(atTime); src.stop(atTime+2.3);
 }
 
-// ── Master chord strike — routes to user sample or built-in synth ─────────────
-function strikeChordTones(chord, sustainSec, vel){
+// Convenience: schedule a chord right now (for single-chord preview)
+function playChordNow(chord, sustainSec, vel, withBass){
+  const ctx = getCtx();
   if(userSampleBuffer){
-    QUAL_INTERVALS[chord.type].forEach((iv,i)=>{
-      const note=getNote(chord.root,iv);
-      userSamplerStrike(note, CHORD_OCTAVE, i===0 ? vel : vel*0.70);
-    });
+    QUAL_INTERVALS[chord.type].forEach((iv,i)=>scheduleUserSample(ctx,getNote(chord.root,iv),CHORD_OCTAVE,ctx.currentTime+i*0.020,i===0?vel:vel*0.70));
+    if(withBass) scheduleBass(ctx, chord.root, ctx.currentTime, sustainSec);
   } else {
-    synthStrikeChord(chord, sustainSec, vel);
+    scheduleChord(ctx, chord, ctx.currentTime, sustainSec, vel, withBass);
   }
-}
-
-function playChordAndBass(chord, sustainSec, vel, withBass){
-  strikeChordTones(chord, sustainSec, vel);
-  if(withBass) playBassRoot(chord.root, sustainSec);
 }
 
 // ── Drone engine ──────────────────────────────────────────────────────────────
@@ -779,47 +764,92 @@ function startHold(idx){
   startDrone(currentProg[idx]);
 }
 function onChordPillClick(idx){
+  // Unlock audio SYNCHRONOUSLY inside the gesture handler — critical for iOS
+  unlockAudio();
   if(isPlaying){stopFlag=true;isPlaying=false;document.getElementById('play-btn').textContent='▶ Play all';}
-  getCtx(); // unlock audio context on user gesture
-  if(heldChordIdx===idx){clearHold(120);document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));return;}
+  if(heldChordIdx===idx){
+    clearHold(120); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held')); return;
+  }
   stopDrone(80); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held')); heldChordIdx=-1;
   selectListenChordSilent(idx);
-  setTimeout(()=>startHold(idx),60);
+  startHold(idx); // start drone immediately (no setTimeout) so it's in the gesture
 }
 
-// ── Playback ──────────────────────────────────────────────────────────────────
-function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+// ── Progression playback — fully clock-scheduled, mobile safe ─────────────────
+// KEY INSIGHT: Schedule ALL audio at once using ctx.currentTime + offsets.
+// Only use setTimeout for UI updates (pill highlights). Never for audio.
+let playTimers = [];
 
 function handlePlay(){
+  // Unlock audio synchronously in the gesture
+  unlockAudio();
   clearHold(80); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));
-  getCtx(); // unlock on user gesture
   playProgression();
 }
 
-async function playProgression(){
-  if(isPlaying)return; isPlaying=true; stopFlag=false;
+function playProgression(){
+  if(isPlaying) return;
+  isPlaying=true; stopFlag=false;
   const btn=document.getElementById('play-btn'); btn.textContent='♪ Playing...';
-  const beatMs=parseInt(document.getElementById('tempo-select').value); const beatSec=beatMs/1000;
-  for(let i=0;i<currentProg.length;i++){
-    if(stopFlag)break;
-    document.querySelectorAll('#prog-display .chord-pill').forEach((p,pi)=>{p.classList.remove('active','played','held');if(pi<i)p.classList.add('played');if(pi===i)p.classList.add('active');});
-    selectListenChordSilent(i); playChordAndBass(currentProg[i],beatSec*0.95,0.82,false); await sleep(beatMs);
-  }
-  document.querySelectorAll('#prog-display .chord-pill').forEach(p=>p.classList.remove('active','played','held'));
-  btn.textContent='▶ Play all'; isPlaying=false;
+  const beatMs=parseInt(document.getElementById('tempo-select').value);
+  const beatSec=beatMs/1000;
+  const ctx=getCtx();
+  const now=ctx.currentTime + 0.05; // small lookahead
+
+  // Schedule all chords at once using audio clock
+  currentProg.forEach((chord,i)=>{
+    scheduleChord(ctx, chord, now + i*beatSec, beatSec*0.95, 0.82, false);
+  });
+
+  // UI-only timers — these never trigger audio, just update visuals
+  playTimers.forEach(clearTimeout); playTimers=[];
+  currentProg.forEach((chord,i)=>{
+    playTimers.push(setTimeout(()=>{
+      if(!isPlaying) return;
+      document.querySelectorAll('#prog-display .chord-pill').forEach((p,pi)=>{
+        p.classList.remove('active','played','held');
+        if(pi<i) p.classList.add('played');
+        if(pi===i) p.classList.add('active');
+      });
+      selectListenChordSilent(i);
+    }, i*beatMs + 50));
+  });
+  // Finish
+  playTimers.push(setTimeout(()=>{
+    document.querySelectorAll('#prog-display .chord-pill').forEach(p=>p.classList.remove('active','played','held'));
+    btn.textContent='▶ Play all'; isPlaying=false;
+  }, currentProg.length*beatMs + 50));
 }
 
 function stopAll(){
-  stopFlag=true; isPlaying=false; clearHold(120);
+  stopFlag=true; isPlaying=false;
+  playTimers.forEach(clearTimeout); playTimers=[];
+  clearHold(120);
   document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));
   document.getElementById('play-btn').textContent='▶ Play all';
 }
 
-async function playChordSequence(chords,beatSec,onStep,withBass){
-  for(let i=0;i<chords.length;i++){
-    if(i>0)await sleep(beatSec*1000); if(onStep)onStep(i); playChordAndBass(chords[i],beatSec*0.92,0.82,withBass);
-  }
-  await sleep(beatSec*1000+400); if(onStep)onStep(-1);
+// Schedule a chord sequence and return a Promise that resolves when done.
+// All audio scheduled immediately using AudioContext clock.
+function playChordSequence(chords, beatSec, onStep, withBass){
+  return new Promise(resolve=>{
+    const ctx=getCtx();
+    const now=ctx.currentTime+0.05;
+    // Schedule all audio at once
+    chords.forEach((chord,i)=>{
+      if(userSampleBuffer){
+        QUAL_INTERVALS[chord.type].forEach((iv,vi)=>scheduleUserSample(ctx,getNote(chord.root,iv),CHORD_OCTAVE,now+i*beatSec+vi*0.020,vi===0?0.82:0.82*0.70));
+        if(withBass) scheduleBass(ctx,chord.root,now+i*beatSec,beatSec*0.92);
+      } else {
+        scheduleChord(ctx,chord,now+i*beatSec,beatSec*0.92,0.82,withBass);
+      }
+    });
+    // UI-only timeouts
+    chords.forEach((chord,i)=>{
+      setTimeout(()=>{if(onStep) onStep(i);},(i*beatSec*1000)+50);
+    });
+    setTimeout(()=>{if(onStep) onStep(-1); resolve();},chords.length*beatSec*1000+450);
+  });
 }
 
 // ── Data ──────────────────────────────────────────────────────────────────────
@@ -908,8 +938,10 @@ function clearSample(){
   document.getElementById('file-input').value='';
 }
 function testSample(){
+  unlockAudio();
+  const ctx=getCtx();
   const note=document.getElementById('sample-root').value,oct=parseInt(document.getElementById('sample-octave').value);
-  userSamplerStrike(note,oct,0.8);
+  scheduleUserSample(ctx,note,oct,ctx.currentTime,0.8);
 }
 
 // ── Quiz ──────────────────────────────────────────────────────────────────────
@@ -920,7 +952,6 @@ function buildQuizProg(){
   const pk=QUIZ_PROG_KEYS[Math.floor(Math.random()*QUIZ_PROG_KEYS.length)];
   return PROGRESSIONS[pk].map((def,i)=>buildChord(key,def,CHORD_ROMAN[pk],i));
 }
-async function playQuizProg(chords){await playChordSequence(chords,0.85,null,true);}
 function buildReviewPills(chords,targetIdx){
   const c=document.getElementById('review-pills');c.innerHTML='';
   chords.forEach((ch,i)=>{
@@ -932,7 +963,10 @@ function buildReviewPills(chords,targetIdx){
 }
 function getReviewPills(){return Array.from(document.querySelectorAll('.review-pill'));}
 async function playReview(){
-  if(reviewPlaying||!quizChords.length)return;reviewPlaying=true;
+  if(reviewPlaying||!quizChords.length)return;
+  // Unlock audio synchronously in this gesture
+  unlockAudio();
+  reviewPlaying=true;
   const btn=document.getElementById('review-play-btn');btn.textContent='♪ Playing...';btn.disabled=true;
   setStatus('reviewing','Reviewing...');
   await playChordSequence(quizChords,0.9,(i)=>{
@@ -950,24 +984,28 @@ function buildAnswerButtons(target){
   });
 }
 async function newQuestion(){
+  // Unlock audio SYNCHRONOUSLY — must happen before any await on iOS
+  unlockAudio();
   answerLocked=false;reviewPlaying=false;
   ['q-feedback','q-review'].forEach(id=>document.getElementById(id).classList.add('hidden'));
   document.getElementById('q-teach-card').innerHTML='';document.getElementById('q-answers').innerHTML='';
   const btn=document.getElementById('q-new-btn');btn.disabled=true;btn.textContent='♪ Playing...';
   setStatus('playing','Playing progression...');
-  getCtx();await sleep(100);
   quizChords=buildQuizProg();
   const targetIdx=Math.floor(Math.random()*quizChords.length);
   currentQuestion={target:quizChords[targetIdx],idx:targetIdx};
   document.getElementById('q-question').textContent=`Listen to the ${quizChords.length}-chord progression. What quality is chord ${targetIdx+1} of ${quizChords.length}?`;
-  await playQuizProg(quizChords);
+  await playChordSequence(quizChords,0.85,null,true);
   setStatus('waiting','Choose the chord quality below');buildAnswerButtons(currentQuestion.target);
   btn.disabled=false;btn.textContent='↩ Replay';btn.onclick=replayQuiz;
 }
 async function replayQuiz(){
   if(!quizChords.length)return;
+  // Unlock audio synchronously in this gesture
+  unlockAudio();
   const btn=document.getElementById('q-new-btn');btn.disabled=true;btn.textContent='♪ Replaying...';
-  setStatus('playing','Playing...');await playQuizProg(quizChords);
+  setStatus('playing','Playing...');
+  await playChordSequence(quizChords,0.85,null,true);
   setStatus('waiting','Choose the chord quality below');btn.disabled=false;btn.textContent='↩ Replay';
 }
 async function checkAnswer(chosen,btn){
@@ -985,7 +1023,8 @@ async function checkAnswer(chosen,btn){
   buildReviewPills(quizChords,currentQuestion.idx);
   document.getElementById('q-teach-card').innerHTML=buildTeachingCardHTML(currentQuestion.target);
   document.getElementById('q-review').classList.remove('hidden');
-  await sleep(500);playReview();
+  // Auto-play review after a short visual pause — use setTimeout (UI only, audio already unlocked)
+  setTimeout(()=>playReview(), 600);
   const btn2=document.getElementById('q-new-btn');btn2.disabled=false;btn2.textContent='New Question';btn2.onclick=newQuestion;
 }
 function resetQuiz(){
