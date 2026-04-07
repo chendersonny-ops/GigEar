@@ -505,10 +505,10 @@
     <div class="sampler-box">
       <div class="sampler-header">
         <h3>Sound patch</h3>
-        <div class="patch-badge loading" id="patch-badge">Loading piano...</div>
+        <div class="patch-badge ready" id="patch-badge">Built-in synth</div>
       </div>
       <p style="font-size:12px;color:var(--text2);margin-bottom:14px;line-height:1.6;">
-        Uses <strong style="color:var(--text);font-weight:500;">Salamander Grand Piano</strong> samples for chords. Bass root uses a warm synth tone. Upload your own instrument below.
+        Uses a <strong style="color:var(--text);font-weight:500;">built-in synth</strong> — works 100% offline, no loading needed. Upload your own recorded note below to replace it.
       </p>
       <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
         <p><strong>Upload your own sample</strong></p>
@@ -538,7 +538,7 @@
       <div id="sampler-error" class="hidden" style="margin-top:10px;font-size:11px;color:#F09595;font-family:'Space Mono',monospace;"></div>
     </div>
     <p style="font-size:11px;color:var(--text3);line-height:1.6;padding:0 2px;">
-      Piano samples load on first play from the internet. After that, the service worker caches them for offline use.
+      The built-in synth works instantly with no internet connection. Your uploaded sample is stored in memory for the session.
     </p>
   </div>
 </div>
@@ -563,7 +563,6 @@
   </button>
 </nav>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
 <script>
 // ── Constants ─────────────────────────────────────────────────────────────────
 const NOTES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
@@ -603,11 +602,9 @@ const BASS_OPEN=[7,2,9,4];
 const NUM_FRETS=12;
 const CHORD_OCTAVE=3;
 const BASS_OCTAVE=2;
-const SALAMANDER_BASE='https://cdn.jsdelivr.net/npm/@danigb/salamander-piano@1.0.0/samples/';
-const SAMPLE_NOTES=['A0','C1','D#1','F#1','A1','C2','D#2','F#2','A2','C3','D#3','F#3','A3','C4','D#4','F#4','A4','C5','D#5','F#5','A5','C6','D#6','F#6','A6','C7','D#7','F#7','A7','C8'];
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let pianoSampler=null,userSampleBuffer=null,samplerReady=false;
+let userSampleBuffer=null;
 let currentProg=[],isPlaying=false,stopFlag=false;
 let quizCorrect=0,quizTotal=0,streak=0;
 let currentQuestion=null,answerLocked=false;
@@ -617,7 +614,7 @@ let sharedCtx=null;
 let deferredInstallPrompt=null;
 let droneNodes=[];
 
-// ── Audio context ─────────────────────────────────────────────────────────────
+// ── Audio context — unlocked on first user gesture ────────────────────────────
 function getCtx(){
   if(!sharedCtx) sharedCtx=new(window.AudioContext||window.webkitAudioContext)();
   if(sharedCtx.state==='suspended') sharedCtx.resume();
@@ -625,32 +622,135 @@ function getCtx(){
 }
 function noteToFreq(note,octave){return 440*Math.pow(2,(NOTES.indexOf(note)+(octave+1)*12-69)/12);}
 
+// ── Piano synth — 100% Web Audio, no CDN needed ───────────────────────────────
+// Layered oscillator approach: sawtooth body + filtered harmonics + short attack transient
+// Sounds like a clean electric piano / keys patch. Works offline, no loading delay.
+function synthPianoNote(ctx, freq, startTime, sustainSec, vol){
+  const out = ctx.createGain();
+  out.connect(ctx.destination);
+
+  // Master envelope: fast attack, decay to sustain level, slow release
+  out.gain.setValueAtTime(0, startTime);
+  out.gain.linearRampToValueAtTime(vol, startTime + 0.006);
+  out.gain.exponentialRampToValueAtTime(vol * 0.45, startTime + 0.08);
+  out.gain.exponentialRampToValueAtTime(vol * 0.35, startTime + 0.3);
+  out.gain.exponentialRampToValueAtTime(0.0001, startTime + sustainSec);
+
+  // Lowpass filter — rolls off harshness, sweeps down for natural decay
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(freq * 14, startTime);
+  lp.frequency.exponentialRampToValueAtTime(freq * 3, startTime + sustainSec * 0.5);
+  lp.Q.value = 0.6;
+  lp.connect(out);
+
+  // Sawtooth — rich in harmonics, gives the characteristic "keys" brightness
+  const saw = ctx.createOscillator();
+  saw.type = 'sawtooth';
+  saw.frequency.value = freq;
+  const gSaw = ctx.createGain(); gSaw.gain.value = 0.7;
+  saw.connect(gSaw); gSaw.connect(lp);
+  saw.start(startTime); saw.stop(startTime + sustainSec + 0.05);
+
+  // Sine fundamental — adds warmth and body under the sawtooth
+  const sine = ctx.createOscillator();
+  sine.type = 'sine';
+  sine.frequency.value = freq;
+  const gSine = ctx.createGain(); gSine.gain.value = 0.5;
+  sine.connect(gSine); gSine.connect(out); // bypass filter for warmth
+  sine.start(startTime); sine.stop(startTime + sustainSec + 0.05);
+
+  // Detuned copy (+7 cents) — adds subtle chorus/width
+  const saw2 = ctx.createOscillator();
+  saw2.type = 'sawtooth';
+  saw2.frequency.value = freq * Math.pow(2, 7/1200);
+  const gSaw2 = ctx.createGain(); gSaw2.gain.value = 0.18;
+  saw2.connect(gSaw2); gSaw2.connect(lp);
+  saw2.start(startTime); saw2.stop(startTime + sustainSec + 0.05);
+
+  // Short noise burst — gives the "hammer" attack click
+  const clickDur = 0.009;
+  const bufSize = Math.ceil(ctx.sampleRate * clickDur);
+  const nb = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+  const nd2 = nb.getChannelData(0);
+  for(let i=0;i<bufSize;i++) nd2[i] = (Math.random()*2-1) * (1 - i/bufSize);
+  const clickSrc = ctx.createBufferSource(); clickSrc.buffer = nb;
+  const clickBP = ctx.createBiquadFilter(); clickBP.type='bandpass'; clickBP.frequency.value=freq*2; clickBP.Q.value=1.2;
+  const clickGain = ctx.createGain();
+  clickGain.gain.setValueAtTime(vol*1.4, startTime);
+  clickGain.gain.exponentialRampToValueAtTime(0.0001, startTime+clickDur);
+  clickSrc.connect(clickBP); clickBP.connect(clickGain); clickGain.connect(out);
+  clickSrc.start(startTime); clickSrc.stop(startTime+clickDur+0.002);
+}
+
+// Strike all 4 chord tones with slight arpeggio (20ms between each)
+function synthStrikeChord(chord, sustainSec, vel){
+  const ctx = getCtx();
+  const ivs = QUAL_INTERVALS[chord.type];
+  ivs.forEach((iv, i) => {
+    const note = getNote(chord.root, iv);
+    const freq = noteToFreq(note, CHORD_OCTAVE);
+    const tOffset = i * 0.020;
+    const v = i === 0 ? vel : vel * 0.68;
+    synthPianoNote(ctx, freq, ctx.currentTime + tOffset, (sustainSec || 1.5) - tOffset, v);
+  });
+}
+
 // ── Bass synth ────────────────────────────────────────────────────────────────
-function playBassRoot(note,sustainSec){
-  const ctx=getCtx();
-  const freq=noteToFreq(note,BASS_OCTAVE);
-  const t=ctx.currentTime;
-  const vol=0.65;
-  const lp=ctx.createBiquadFilter();lp.type='lowpass';lp.frequency.value=Math.min(freq*5,1200);lp.Q.value=0.7;lp.connect(ctx.destination);
-  const master=ctx.createGain();
-  master.gain.setValueAtTime(0,t);master.gain.linearRampToValueAtTime(vol,t+0.03);
-  master.gain.setValueAtTime(vol,t+sustainSec*0.55);master.gain.exponentialRampToValueAtTime(0.001,t+sustainSec);
+function playBassRoot(note, sustainSec){
+  const ctx = getCtx();
+  const freq = noteToFreq(note, BASS_OCTAVE);
+  const t = ctx.currentTime;
+  const vol = 0.70;
+  const lp = ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=Math.min(freq*5,1100); lp.Q.value=0.7; lp.connect(ctx.destination);
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0,t); master.gain.linearRampToValueAtTime(vol,t+0.025);
+  master.gain.setValueAtTime(vol,t+sustainSec*0.5); master.gain.exponentialRampToValueAtTime(0.001,t+sustainSec);
   master.connect(lp);
-  const sine=ctx.createOscillator();sine.type='sine';sine.frequency.value=freq;
-  const gS=ctx.createGain();gS.gain.value=1.0;sine.connect(gS);gS.connect(master);sine.start(t);sine.stop(t+sustainSec+0.1);
-  const tri=ctx.createOscillator();tri.type='triangle';tri.frequency.value=freq*2;
-  const gT=ctx.createGain();gT.gain.value=0.25;tri.connect(gT);gT.connect(master);tri.start(t);tri.stop(t+sustainSec+0.1);
+  const sine = ctx.createOscillator(); sine.type='sine'; sine.frequency.value=freq;
+  const gS = ctx.createGain(); gS.gain.value=1.0; sine.connect(gS); gS.connect(master); sine.start(t); sine.stop(t+sustainSec+0.1);
+  const tri = ctx.createOscillator(); tri.type='triangle'; tri.frequency.value=freq*2;
+  const gT = ctx.createGain(); gT.gain.value=0.3; tri.connect(gT); gT.connect(master); tri.start(t); tri.stop(t+sustainSec+0.1);
+}
+
+// ── User sample playback ──────────────────────────────────────────────────────
+function userSamplerStrike(note, octave, vol){
+  if(!userSampleBuffer) return;
+  const ctx = getCtx(); const t = ctx.currentTime;
+  const rootNote = document.getElementById('sample-root').value;
+  const rootOct = parseInt(document.getElementById('sample-octave').value);
+  const semitones = (NOTES.indexOf(note)+(octave+1)*12) - (NOTES.indexOf(rootNote)+(rootOct+1)*12);
+  const src = ctx.createBufferSource(); src.buffer=userSampleBuffer; src.playbackRate.value=Math.pow(2,semitones/12);
+  const env = ctx.createGain(); env.gain.setValueAtTime(vol,t); env.gain.setValueAtTime(vol,t+1.2); env.gain.exponentialRampToValueAtTime(0.0001,t+2.2);
+  src.connect(env); env.connect(ctx.destination); src.start(t); src.stop(t+2.3);
+}
+
+// ── Master chord strike — routes to user sample or built-in synth ─────────────
+function strikeChordTones(chord, sustainSec, vel){
+  if(userSampleBuffer){
+    QUAL_INTERVALS[chord.type].forEach((iv,i)=>{
+      const note=getNote(chord.root,iv);
+      userSamplerStrike(note, CHORD_OCTAVE, i===0 ? vel : vel*0.70);
+    });
+  } else {
+    synthStrikeChord(chord, sustainSec, vel);
+  }
+}
+
+function playChordAndBass(chord, sustainSec, vel, withBass){
+  strikeChordTones(chord, sustainSec, vel);
+  if(withBass) playBassRoot(chord.root, sustainSec);
 }
 
 // ── Drone engine ──────────────────────────────────────────────────────────────
 function createDroneTone(ctx,freq,vol){
   const master=ctx.createGain();
-  master.gain.setValueAtTime(0,ctx.currentTime);master.gain.linearRampToValueAtTime(vol,ctx.currentTime+0.04);
+  master.gain.setValueAtTime(0,ctx.currentTime); master.gain.linearRampToValueAtTime(vol,ctx.currentTime+0.04);
   master.connect(ctx.destination);
   const nodes=[];
   [[1,1.0],[2,0.35],[3,0.12],[Math.pow(2,4/1200),0.45]].forEach(([mult,g])=>{
-    const o=ctx.createOscillator();o.type='sine';o.frequency.value=freq*mult;
-    const gn=ctx.createGain();gn.gain.value=g;o.connect(gn);gn.connect(master);o.start();nodes.push(o);
+    const o=ctx.createOscillator(); o.type='sine'; o.frequency.value=freq*mult;
+    const gn=ctx.createGain(); gn.gain.value=g; o.connect(gn); gn.connect(master); o.start(); nodes.push(o);
   });
   return{master,nodes};
 }
@@ -660,7 +760,7 @@ function startDrone(chord){
   droneNodes=QUAL_INTERVALS[chord.type].map((iv,i)=>createDroneTone(ctx,noteToFreq(getNote(chord.root,iv),CHORD_OCTAVE),vols[i]));
 }
 function stopDrone(fadeMs){
-  const fade=(fadeMs||80)/1000;const ctx=getCtx();
+  const fade=(fadeMs||80)/1000; const ctx=getCtx();
   droneNodes.forEach(({master,nodes})=>{
     master.gain.setValueAtTime(master.gain.value,ctx.currentTime);
     master.gain.linearRampToValueAtTime(0,ctx.currentTime+fade);
@@ -669,92 +769,57 @@ function stopDrone(fadeMs){
   droneNodes=[];
 }
 
-// ── Hold ──────────────────────────────────────────────────────────────────────
+// ── Hold (drone on tap) ───────────────────────────────────────────────────────
 function clearHold(fadeMs){
   if(heldChordIdx!==-1){const p=document.getElementById('chord-pill-'+heldChordIdx);if(p)p.classList.remove('held');heldChordIdx=-1;}
   stopDrone(fadeMs);
 }
 function startHold(idx){
-  heldChordIdx=idx;const p=document.getElementById('chord-pill-'+idx);if(p)p.classList.add('held');
+  heldChordIdx=idx; const p=document.getElementById('chord-pill-'+idx); if(p)p.classList.add('held');
   startDrone(currentProg[idx]);
 }
 function onChordPillClick(idx){
   if(isPlaying){stopFlag=true;isPlaying=false;document.getElementById('play-btn').textContent='▶ Play all';}
-  Tone.start();getCtx();
+  getCtx(); // unlock audio context on user gesture
   if(heldChordIdx===idx){clearHold(120);document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));return;}
-  stopDrone(80);document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));heldChordIdx=-1;
+  stopDrone(80); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held')); heldChordIdx=-1;
   selectListenChordSilent(idx);
   setTimeout(()=>startHold(idx),60);
-}
-
-// ── Piano sampler ─────────────────────────────────────────────────────────────
-async function initPiano(){
-  const badge=document.getElementById('patch-badge');badge.textContent='Loading piano...';badge.className='patch-badge loading';
-  try{
-    await Tone.start();
-    const noteMap={};SAMPLE_NOTES.forEach(n=>{noteMap[n]=SALAMANDER_BASE+n.replace('#','s')+'.mp3';});
-    pianoSampler=new Tone.Sampler(noteMap,{release:1.2,onload:()=>{samplerReady=true;badge.textContent='Salamander Grand';badge.className='patch-badge ready';}}).toDestination();
-    const reverb=new Tone.Reverb({decay:2.5,preDelay:0.02,wet:0.22}).toDestination();pianoSampler.connect(reverb);
-  }catch(e){badge.textContent='Samples unavailable';badge.className='patch-badge';}
-}
-
-function userSamplerStrike(note,octave,vol){
-  if(!userSampleBuffer)return;
-  const ctx=getCtx();const t=ctx.currentTime;
-  const rootNote=document.getElementById('sample-root').value;const rootOct=parseInt(document.getElementById('sample-octave').value);
-  const semitones=(NOTES.indexOf(note)+(octave+1)*12)-(NOTES.indexOf(rootNote)+(rootOct+1)*12);
-  const src=ctx.createBufferSource();src.buffer=userSampleBuffer;src.playbackRate.value=Math.pow(2,semitones/12);
-  const env=ctx.createGain();env.gain.setValueAtTime(vol,t);env.gain.setValueAtTime(vol,t+1.2);env.gain.exponentialRampToValueAtTime(0.0001,t+2.2);
-  src.connect(env);env.connect(ctx.destination);src.start(t);src.stop(t+2.3);
-}
-
-function strikeChordTones(chord,sustainSec,vel){
-  QUAL_INTERVALS[chord.type].forEach((iv,i)=>{
-    const note=getNote(chord.root,iv);const tOffset=i*0.022;
-    if(userSampleBuffer){userSamplerStrike(note,CHORD_OCTAVE,i===0?vel:vel*0.72);}
-    else if(samplerReady&&pianoSampler){pianoSampler.triggerAttackRelease(note+CHORD_OCTAVE,(sustainSec||1.6)-tOffset,Tone.now()+tOffset,i===0?vel:vel*0.72);}
-  });
-}
-
-function playChordAndBass(chord,sustainSec,vel,withBass){
-  strikeChordTones(chord,sustainSec,vel);
-  if(withBass)playBassRoot(chord.root,sustainSec);
 }
 
 // ── Playback ──────────────────────────────────────────────────────────────────
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
-async function handlePlay(){
-  clearHold(80);document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));
-  await Tone.start();if(!pianoSampler)await initPiano();await sleep(200);
+function handlePlay(){
+  clearHold(80); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));
+  getCtx(); // unlock on user gesture
   playProgression();
 }
 
 async function playProgression(){
-  if(isPlaying)return;isPlaying=true;stopFlag=false;
-  const btn=document.getElementById('play-btn');btn.textContent='♪ Playing...';
-  const beatMs=parseInt(document.getElementById('tempo-select').value);const beatSec=beatMs/1000;
+  if(isPlaying)return; isPlaying=true; stopFlag=false;
+  const btn=document.getElementById('play-btn'); btn.textContent='♪ Playing...';
+  const beatMs=parseInt(document.getElementById('tempo-select').value); const beatSec=beatMs/1000;
   for(let i=0;i<currentProg.length;i++){
     if(stopFlag)break;
     document.querySelectorAll('#prog-display .chord-pill').forEach((p,pi)=>{p.classList.remove('active','played','held');if(pi<i)p.classList.add('played');if(pi===i)p.classList.add('active');});
-    selectListenChordSilent(i);playChordAndBass(currentProg[i],beatSec*0.95,0.82,false);await sleep(beatMs);
+    selectListenChordSilent(i); playChordAndBass(currentProg[i],beatSec*0.95,0.82,false); await sleep(beatMs);
   }
   document.querySelectorAll('#prog-display .chord-pill').forEach(p=>p.classList.remove('active','played','held'));
-  btn.textContent='▶ Play all';isPlaying=false;
+  btn.textContent='▶ Play all'; isPlaying=false;
 }
 
 function stopAll(){
-  stopFlag=true;isPlaying=false;clearHold(120);
+  stopFlag=true; isPlaying=false; clearHold(120);
   document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));
-  if(samplerReady&&pianoSampler)pianoSampler.releaseAll();
   document.getElementById('play-btn').textContent='▶ Play all';
 }
 
 async function playChordSequence(chords,beatSec,onStep,withBass){
   for(let i=0;i<chords.length;i++){
-    if(i>0)await sleep(beatSec*1000);if(onStep)onStep(i);playChordAndBass(chords[i],beatSec*0.92,0.82,withBass);
+    if(i>0)await sleep(beatSec*1000); if(onStep)onStep(i); playChordAndBass(chords[i],beatSec*0.92,0.82,withBass);
   }
-  await sleep(beatSec*1000+400);if(onStep)onStep(-1);
+  await sleep(beatSec*1000+400); if(onStep)onStep(-1);
 }
 
 // ── Data ──────────────────────────────────────────────────────────────────────
@@ -838,8 +903,8 @@ function loadSampleFile(file){
 }
 function clearSample(){
   userSampleBuffer=null;document.getElementById('sampler-loaded').classList.add('hidden');
-  document.getElementById('patch-badge').textContent=samplerReady?'Salamander Grand':'Built-in synth';
-  document.getElementById('patch-badge').className=samplerReady?'patch-badge ready':'patch-badge';
+  document.getElementById('patch-badge').textContent='Built-in synth';
+  document.getElementById('patch-badge').className='patch-badge ready';
   document.getElementById('file-input').value='';
 }
 function testSample(){
@@ -890,7 +955,7 @@ async function newQuestion(){
   document.getElementById('q-teach-card').innerHTML='';document.getElementById('q-answers').innerHTML='';
   const btn=document.getElementById('q-new-btn');btn.disabled=true;btn.textContent='♪ Playing...';
   setStatus('playing','Playing progression...');
-  await Tone.start();if(!pianoSampler)await initPiano();await sleep(300);
+  getCtx();await sleep(100);
   quizChords=buildQuizProg();
   const targetIdx=Math.floor(Math.random()*quizChords.length);
   currentQuestion={target:quizChords[targetIdx],idx:targetIdx};
@@ -964,7 +1029,6 @@ if('serviceWorker' in navigator){
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 updateProg();
-initPiano();
 </script>
 </body>
 </html>
