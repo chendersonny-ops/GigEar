@@ -423,8 +423,8 @@ async function getDecodedSample(key) {
 
 // Pre-decode both samples in the background after first gesture
 function preloadSamples() {
-  setTimeout(() => getDecodedSample('electric').catch(()=>{});, 200);
-  setTimeout(() => getDecodedSample('acoustic').catch(()=>{});, 800);
+  setTimeout(function(){ getDecodedSample('electric').catch(function(){}); }, 200);
+  setTimeout(function(){ getDecodedSample('acoustic').catch(function(){}); }, 800);
 }
 
 
