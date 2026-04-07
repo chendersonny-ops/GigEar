@@ -446,20 +446,21 @@ let deferredInstall=null;
 function createCtx(){
   if(CTX) return;
   CTX = new(window.AudioContext||window.webkitAudioContext)();
-  // Warm up with a silent buffer — fully unlocks audio on iOS
-  const b=CTX.createBuffer(1,1,22050);
+  // Unlock: play a zero-length silent buffer inside the gesture
+  const b=CTX.createBuffer(1,1,CTX.sampleRate);
   const s=CTX.createBufferSource();
   s.buffer=b; s.connect(CTX.destination); s.start(0);
-  // Keep alive: a silent gain node connected permanently prevents auto-suspend
-  const keep=CTX.createGain(); keep.gain.value=0; keep.connect(CTX.destination);
-  const keepOsc=CTX.createOscillator(); keepOsc.frequency.value=1;
-  keepOsc.connect(keep); keepOsc.start();
 }
-function ctx(){
-  // Resume if browser suspended it (e.g. tab backgrounded)
-  if(CTX && CTX.state==='suspended') CTX.resume();
-  return CTX;
+// Call this at the start of every audio-triggering button handler.
+// Returns a Promise that resolves only when the context is confirmed running.
+// iOS resumes are async — we must await this before scheduling any notes.
+function readyCtx(){
+  if(!CTX) createCtx();
+  if(CTX.state==='running') return Promise.resolve(CTX);
+  return CTX.resume().then(function(){ return CTX; });
 }
+// Sync accessor for drone (already inside gesture, already running)
+function ctx(){ return CTX; }
 function ntof(note,oct){return 440*Math.pow(2,(NOTES.indexOf(note)+(oct+1)*12-69)/12);}
 
 // ── Piano synth ───────────────────────────────────────────────────────────────
@@ -567,31 +568,32 @@ function clearHold(ms){
   if(heldIdx!==-1){const p=document.getElementById('chord-pill-'+heldIdx);if(p)p.classList.remove('held');heldIdx=-1;}
   stopDrone(ms);
 }
-function onChordPillClick(idx){
+async function onChordPillClick(idx){
   if(playing){stopFlag=true;playing=false;document.getElementById('play-btn').textContent='▶ Play all';}
   if(heldIdx===idx){
     clearHold(120); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held')); return;
   }
   stopDrone(80); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held')); heldIdx=-1;
   selectChordSilent(idx);
+  await readyCtx(); // ensure context running before drone oscillators start
   heldIdx=idx; const p=document.getElementById('chord-pill-'+idx); if(p)p.classList.add('held');
   startDrone(prog[idx]);
 }
 
 // ── Playback — all audio clock-scheduled, UI via setTimeout ──────────────────
-function handlePlay(){
+async function handlePlay(){
   clearHold(80); document.querySelectorAll('.chord-pill').forEach(p=>p.classList.remove('active','played','held'));
-  playProg();
+  await playProg();
 }
 
-function playProg(){
+async function playProg(){
   if(playing) return;
   playing=true; stopFlag=false;
   const btn=document.getElementById('play-btn'); btn.textContent='♪ Playing...';
   const beatMs=parseInt(document.getElementById('tempo-select').value);
   const beatSec=beatMs/1000;
-  const c=ctx(); const now=c.currentTime+0.05;
-  // Schedule ALL chords at once inside this synchronous call — iOS safe
+  // Await resume BEFORE scheduling — critical on iOS
+  const c=await readyCtx(); const now=c.currentTime+0.05;
   prog.forEach((chord,i)=>schedChord(c,chord,now+i*beatSec,beatSec*0.95,0.82,false));
   // UI only via setTimeout
   uiTimers.forEach(clearTimeout); uiTimers=[];
@@ -622,12 +624,12 @@ function stopAll(){
 // Returns a Promise that resolves after the sequence plays.
 // Schedules all audio synchronously, UI updates via setTimeout.
 function playSeq(chords,beatSec,onStep,withBass){
-  return new Promise(resolve=>{
-    const c=ctx(); const now=c.currentTime+0.05;
+  return readyCtx().then(function(c){return new Promise(function(resolve){
+    const now=c.currentTime+0.05;
     chords.forEach((chord,i)=>schedChord(c,chord,now+i*beatSec,beatSec*0.92,0.82,withBass));
-    chords.forEach((_,i)=>setTimeout(()=>{if(onStep)onStep(i);},(i*beatSec*1000)+50));
-    setTimeout(()=>{if(onStep)onStep(-1);resolve();},chords.length*beatSec*1000+450);
-  });
+    chords.forEach((_,i)=>setTimeout(function(){if(onStep)onStep(i);},(i*beatSec*1000)+50));
+    setTimeout(function(){if(onStep)onStep(-1);resolve();},chords.length*beatSec*1000+450);
+  });});
 }
 
 // ── Data helpers ──────────────────────────────────────────────────────────────
@@ -739,11 +741,12 @@ function clearSample(){
   document.getElementById('patch-badge').className='patch-badge ready';
   const st=document.getElementById('upload-status'); st.textContent=''; st.classList.add('hidden');
 }
-function testSample(){
-  if(!sampleBuf||!CTX) return;
+async function testSample(){
+  if(!sampleBuf) return;
+  const c=await readyCtx();
   const note=document.getElementById('sample-root').value;
   const oct=parseInt(document.getElementById('sample-octave').value);
-  sampleNote(CTX,note,oct,CTX.currentTime+0.01,0.8);
+  sampleNote(c,note,oct,c.currentTime+0.01,0.8);
 }
 
 // ── Quiz ──────────────────────────────────────────────────────────────────────
@@ -794,7 +797,7 @@ async function newQuestion(){
   const ti=Math.floor(Math.random()*qChords.length);
   qCurrent={target:qChords[ti],idx:ti};
   document.getElementById('q-question').textContent=`Listen to the ${qChords.length}-chord progression. What quality is chord ${ti+1} of ${qChords.length}?`;
-  // Schedule ALL quiz audio synchronously before the first await
+  // readyCtx() is awaited inside playSeq via the promise chain
   await playSeq(qChords,0.85,null,true);
   setSt('waiting','Choose the chord quality below');
   buildAns(qCurrent.target);
@@ -865,10 +868,9 @@ if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.se
 
 // ── Boot — gate button is the ONLY audio unlock path ─────────────────────────
 document.getElementById('gate-btn').addEventListener('click',function(){
-  // Create AudioContext synchronously, right here, in this click handler.
-  // This is the iOS-approved unlock pattern.
   createCtx();
-  // Show the app
+  // Also call resume immediately — on some iOS versions creation alone is not enough
+  if(CTX.state!=='running') CTX.resume();
   document.getElementById('audio-gate').classList.add('hidden');
   document.getElementById('main-app').style.display='';
   updateProg();
