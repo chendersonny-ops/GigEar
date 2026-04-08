@@ -251,7 +251,7 @@
       </div>
       <div class="sg"><label>Quality</label>
         <select id="fb-qual" onchange="renderFBPanel()">
-          <option value="maj7">Major 7th (D7)</option>
+          <option value="maj7">Major 7th (Δ7)</option>
           <option value="dom7">Dominant 7th (7)</option>
           <option value="min7">Minor 7th (m7)</option>
         </select>
@@ -322,7 +322,7 @@ const TN={
   dom7:{0:'Root',4:'Maj 3rd',7:'5th',10:'b7th'},
   min7:{0:'Root',3:'Min 3rd',7:'5th',10:'b7th'},
 };
-const QL={maj7:'Major 7th (D7)',dom7:'Dominant 7th (7)',min7:'Minor 7th (m7)'};
+const QL={maj7:'Major 7th (Δ7)',dom7:'Dominant 7th (7)',min7:'Minor 7th (m7)'};
 const BT={
   maj7:(r,t)=>'Start on '+nd(r)+' (root). Maj 3rd ('+nd(t[1])+') gives bright colour. Walk root to 5th ('+nd(t[2])+') to maj 7th ('+nd(t[3])+').',
   dom7:(r,t)=>'Dominant tension: tritone between '+nd(t[1])+' (3rd) and '+nd(t[3])+' (b7). Target the b7 as chromatic approach from root '+nd(r)+'.',
@@ -572,7 +572,7 @@ function setPatch(key){
 // ---- Music data ----
 function buildChord(key,def,romans,idx){
   var root=gn(key,def.d),ivs=QI[def.t],tones=ivs.map(function(iv){return gn(root,iv);});
-  return{root:root,type:def.t,name:nd(root)+(def.t==='min7'?'m7':def.t==='dom7'?'7':'D7'),roman:romans?romans[idx]:'',tones:tones,intervals:ivs};
+  return{root:root,type:def.t,name:nd(root)+(def.t==='min7'?'m7':def.t==='dom7'?'7':'Δ7'),roman:romans?romans[idx]:'',tones:tones,intervals:ivs};
 }
 function updateProg(){
   clearHold(60);
@@ -652,7 +652,7 @@ function buildAns(target){
   var grid=document.getElementById('q-answers');grid.innerHTML='';
   ['maj7','dom7','min7'].sort(function(){return Math.random()-0.5;}).forEach(function(opt){
     var b=document.createElement('button');b.className='ans-btn';b.dataset.type=opt;
-    b.innerHTML='<div style="font-weight:700;font-size:16px;margin-bottom:2px">'+(opt==='maj7'?'D7':opt==='dom7'?'dom7':'m7')+'</div><div style="font-size:11px;opacity:0.65">'+QL[opt]+'</div>';
+    b.innerHTML='<div style="font-weight:700;font-size:16px;margin-bottom:2px">'+(opt==='maj7'?'Δ7':opt==='dom7'?'dom7':'m7')+'</div><div style="font-size:11px;opacity:0.65">'+QL[opt]+'</div>';
     (function(o,btn){btn.onclick=function(){checkAns(o,btn);};})(opt,b);
     grid.appendChild(b);
   });
@@ -729,7 +729,7 @@ function resetQuiz(){
 function renderFBPanel(){
   var root=document.getElementById('fb-note').value,qual=document.getElementById('fb-qual').value;
   var ivs=QI[qual],tones=ivs.map(function(iv){return gn(root,iv);});
-  var chord={root:root,type:qual,name:nd(root)+(qual==='min7'?'m7':qual==='dom7'?'7':'D7'),roman:'',tones:tones,intervals:ivs};
+  var chord={root:root,type:qual,name:nd(root)+(qual==='min7'?'m7':qual==='dom7'?'7':'Δ7'),roman:'',tones:tones,intervals:ivs};
   renderTC(chord,'fb-tc');renderFB(chord,'fb2-display','fb2-fret-nums');
 }
 
