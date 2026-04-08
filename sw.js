@@ -1,84 +1,70 @@
-// Bass Ear Training — Service Worker
-// Caches the app shell and piano samples for offline use
+// GigEar Service Worker v3
+// IMPORTANT: bump the version number here whenever index.html changes,
+// so old cached versions get replaced immediately.
 
-const CACHE_NAME = 'bass-ear-v1';
-const SAMPLE_CACHE = 'bass-ear-samples-v1';
+const CACHE_NAME = 'gigear-v3';
 
-// App shell — always cached on install
-const SHELL_ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  'https://fonts.googleapis.com/css2?family=Syne:wght@400;500;700;800&family=Space+Mono:wght@400;700&display=swap',
-  'https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js'
+// Only cache truly static assets - NOT index.html
+// index.html must always be fetched fresh from network so updates land immediately
+const STATIC_ASSETS = [
+  'icons/icon-192.png',
+  'icons/icon-512.png',
+  'manifest.json'
 ];
 
-// Piano sample URLs — cached on first fetch, reused offline
-const SALAMANDER_BASE = 'https://cdn.jsdelivr.net/npm/@danigb/salamander-piano@1.0.0/samples/';
-const SAMPLE_NOTES = [
-  'A0','C1','Ds1','Fs1','A1','C2','Ds2','Fs2','A2',
-  'C3','Ds3','Fs3','A3','C4','Ds4','Fs4','A4',
-  'C5','Ds5','Fs5','A5','C6','Ds6','Fs6','A6',
-  'C7','Ds7','Fs7','A7','C8'
-];
-const SAMPLE_URLS = SAMPLE_NOTES.map(n => SALAMANDER_BASE + n + '.mp3');
-
-// Install — cache app shell immediately
+// Install: cache only static assets
 self.addEventListener('install', event => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => {
-      return cache.addAll(SHELL_ASSETS).catch(err => {
-        // Don't fail install if external resources are unavailable
-        console.warn('Shell cache warning:', err);
-      });
-    }).then(() => self.skipWaiting())
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(STATIC_ASSETS).catch(() => {}))
+      .then(() => self.skipWaiting())
   );
 });
 
-// Activate — clear old caches
+// Activate: delete ALL old caches immediately
 self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys().then(keys => {
-      return Promise.all(
-        keys
-          .filter(k => k !== CACHE_NAME && k !== SAMPLE_CACHE)
-          .map(k => caches.delete(k))
-      );
-    }).then(() => self.clients.claim())
+    caches.keys()
+      .then(keys => Promise.all(keys.map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
   );
 });
 
-// Fetch — serve from cache, fall back to network, cache piano samples
+// Fetch strategy:
+// - index.html: ALWAYS network-first, fall back to cache only if offline
+// - icons/manifest: cache-first
+// - everything else: network only
 self.addEventListener('fetch', event => {
-  const url = event.request.url;
+  const url = new URL(event.request.url);
+  const isLocal = url.origin === location.origin;
+  const isHTML = url.pathname === '/' || url.pathname.endsWith('.html');
+  const isIcon = url.pathname.startsWith('/icons/') || url.pathname.endsWith('manifest.json');
 
-  // Piano samples: cache-first with network fallback, then store for offline
-  if (SAMPLE_URLS.some(s => url.includes(s) || url.startsWith(SALAMANDER_BASE))) {
+  if (isHTML && isLocal) {
+    // Network-first for HTML — always get the latest version
     event.respondWith(
-      caches.open(SAMPLE_CACHE).then(cache => {
-        return cache.match(event.request).then(cached => {
-          if (cached) return cached;
-          return fetch(event.request).then(response => {
-            if (response.ok) cache.put(event.request, response.clone());
-            return response;
-          });
-        });
-      })
+      fetch(event.request)
+        .then(response => {
+          // Cache a copy for offline fallback
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+          }
+          return response;
+        })
+        .catch(() => caches.match(event.request))
     );
     return;
   }
 
-  // App shell + fonts + Tone.js: stale-while-revalidate
-  event.respondWith(
-    caches.match(event.request).then(cached => {
-      const networkFetch = fetch(event.request).then(response => {
-        if (response.ok) {
-          caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()));
-        }
-        return response;
-      }).catch(() => null);
+  if (isIcon && isLocal) {
+    // Cache-first for icons/manifest
+    event.respondWith(
+      caches.match(event.request)
+        .then(cached => cached || fetch(event.request))
+    );
+    return;
+  }
 
-      return cached || networkFetch;
-    })
-  );
+  // All other requests: straight to network
 });
